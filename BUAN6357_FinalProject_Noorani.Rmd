@@ -1,0 +1,947 @@
+---
+title: "Which Diabetes Patients will be Hopsital Readmits?"
+author: "Aneesa Noorani"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output: html_document
+fontsize: 12pt
+geometry: margin=0.75in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=6, fig.height=4, fig.align = "center")
+options(tinytex.verbose = TRUE)
+```
+
+**Executive Summary**  
+  Increased healthcare costs are a high-priority concern for the nation. Every policy maker, healthcare administrator, healthcare provider, and patient is concerned with exponential costs. One method for achieving lower healthcare costs is to reduce hospital readmission rates. A logical approach to control costs is to use predictive analytic techniques to identify patients most likely to be readmitted within 30 days of being discharged from the hospital. This report uses a number of modeling techniques for the analyses. I conclude that the decision tree provides the best model for predicting whether a patient is likely to be readmitted in less than 30 days.
+
+**Part A: Introduction**  
+
+  Hospital readmission rates serve as a benchmark for healthcare administrators and the government in assessing a hospital's quality. This is because the cost burden of readmissions is high, and cost-reduction is an ever-elusive goal.
+  
+  Amongst all-cause hospital readmissions, diabetes readmissions are more prevalent and also more costly as compared to other types of readmissions. At New York Presbyterian Hospital, diabetes patients have a 30-day readmission rate of 14.4 - 21%, as compared to the general inpatient population readmission rate of 8.5 - 13.5% (sinha-Gregory et al, 2015). In addition, according to a 2018 guide published by the Centers for Medicare and Medicaid Services (CMS), the annual cost associated with excess readmissions for diabetes patients, amongst Medicare beneficiaries, is $251 million. Thus, it is clear that diabetes readmissions deserve special attention from hospital administrators (CMS, 2018).
+  
+  Some of the risk factors associated with a higher likelihood of readmission include a lower socioeconomic status, belonging to a racial minority, the type of admission and a recent histoty of prior hospitalization (Rubin, 2015). Hence, analyzing a dataset that includes some of these risk factors can be beneficial to a hospital in predicting which patients are more likely to be readmitted. The hospital staff can then take more precautionary measures such as infection-prevention, or educate patients more meticulously on discharge instructions. Simply put, readmission prediction for high-risk patients can lead to increased attention towards those predicted to be readmitted, and ideally lead to fewer unnecessary readmissions.  
+  
+```{r setup libraries, echo=FALSE, include=FALSE}
+#installing libraries & data set
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(knitr, pacman, readr, e1071, caret, tidyverse, gains, ggplot2, 
+               dplyr, plyr, naniar, Hmisc, funModeling, DMwR, stats, pls, rbin, 
+               OneR, forcats, pROC, rpart, factoextra, kernlab, ROCR, tinytex)
+theme_set(theme_classic())
+
+original_df <- read_csv("diabetic_data.csv")
+
+  #eliminate encounter_id column, since it's an identifier column. But since we're
+    #interested in aggregate data, it's not necessary
+diabetes.df <- original_df %>% select(-c(encounter_id))
+```
+
+**Part B: Data Description**  
+  This dataset was obtained from the University of California at Irvine's (UCI) Machine Learning Repository archives. It contains data collected from 1999 to 2008, from 130 US hospitals and integrated delivery networks. It consists of 101,767 observations on 71,518 unique patients, and has 50 explanatory variables. The encounter_id column, which is the first column in the data set, serves as an index column.
+  
+  An observation was only included in the data set if it met the following criteria: 1) inpatient encounter (which means it was a hospital admission); 2) any kind of diabetes diagnosis was entered in the system; 3) length of stay was between 1-14 days; 4) laboratory tests were performed; 5) medeciations were administered.  
+  
+  Some of the key attributes in the data set include: race, gender, age, time in hospital, admission type, discharge type, number of medications, and number of inpatient, outpatient and emergency visits in the year before the documented hospitalization.
+  
+  It is interesting to note that of the 50 explanatory variables, 23 indicate whether a patient’s dosage for a given medication was increased, decreased, kept the same, or not prescribed. That is to say, there is an individual explanatory variable for 23 different medications.
+  
+  Most importantly, the a-priori probability of the class of interest, which is patients who were admitted to the hospital in less than 30 days is 11.16%, or 11,357 rows.
+  
+  One important weakness of the data set is that it does not include the date of the patient encounter. If it did, time series analyses would have been possible to see if there was a trend, seasonality, autocorrelations, etc. in the readmission rate.
+  
+  Please see Supplement for full list of independent and target variables.
+  
+```{r Data Descript}
+  #count number of unique patients
+length(unique(diabetes.df$patient_nbr))
+
+  #how rare is the class of interest?
+Un1 <- prop.table(table(diabetes.df$readmitted))
+Un1
+```
+
+**Part C: Data Preprocessing**  
+    Several columns in this data set had missing values, or incomplete information. Preprocessing the data occurred in ten steps, as outlined below.
+    
+*Step 1: eliminate variables with high proportion of missing values*
+
+A) The weight variable had 97% missing values. A variable with such a high proportion of missing information is of little value.  Thus, it was easy to decide to drop this variable from the analysis.  
+```{r Eliminate Weight Var, echo=FALSE}
+diabetes.df <- diabetes.df %>% select(-c(weight))
+```
+
+B) The payer_code variable had 52% missing values. If we simply used a 50% threshold as our benchmark for determining whether to eliminate this variable, it would have been eliminated. However, it is important to consider whether the presence or absence of this variable affects the outcome variable. To determine this, I conducted a t-test to compare the readmission rate for those observations with a value in the payer_code column, versus observations without a value.
+```{r Payer_code ttest, echo=FALSE}
+  #viewing initial means across payer code & readmission type (<30,>30,No)
+#prop.table(table(diabetes.df$readmitted, diabetes.df$payer_code), margin = 1)
+diabetes.copy <- diabetes.df
+
+#recode the 3 readmission possibilities as numerical variables, at least for this calculation. 
+  #The #s themselves don't matter, as long as it's consistent
+diabetes.copy$readmitted <- as.numeric(as.factor(diabetes.copy$readmitted))
+
+#extracting the readmission means, grouped by payer code
+payer_code_mean <- diabetes.copy %>% group_by(payer_code) %>% 
+  summarise_at(vars(readmitted), mean, na.rm = TRUE)
+
+#converting to data frame
+payer_code_mean <- as.data.frame(payer_code_mean)
+#extracting means for paer_code = NA, versus the others
+payer_code_NA_mean <- payer_code_mean[1,2]
+payer_code_other_mean <- mean(payer_code_mean[2:18,2])
+
+#now we can do a t-test to see if the difference between the means is significant
+ttest_pay <- t.test(payer_code_mean[2:18,2], alternative = "two.sided", 
+                    mu = payer_code_NA_mean)
+ttest_pay
+```
+  
+  Null hypothesis of the t-test is: true mean is equal to 2.4266. The t-test result is not significant at the 1%, or even 5%, significance level. This means we cannot reject the null hypothesis. In other words, the difference between the readmission means for those observations that do have a payer code associated with them vs. those observations that do not, is not significant. Hence, the variable can be removed from the analysis without having a significant impact on the final result.
+```{r payer_code variable removal, echo=FALSE}
+#eliminating payer_code variable
+diabetes.df <- diabetes.df %>% select(-c(payer_code))
+```
+
+C) I then repeated the process for the medical_specialty column, since it also has 53% missing values.
+```{r Medical specialty Column ttest, echo=FALSE}
+  #viewing initial means across medical specialty & readmission type (<30,>30,No)
+#prop.table(table(diabetes.df$readmitted, diabetes.df$medical_specialty), margin = 1)
+
+#extracting the readmission means, grouped by payer code
+med_specialty_mean <- diabetes.copy %>% group_by(medical_specialty) %>% 
+  summarise_at(vars(readmitted), mean, na.rm = TRUE)
+
+#converting to data frame
+med_specialty_mean <- as.data.frame(med_specialty_mean)
+#extracting means for payer_code = NA, versus the others
+med_spec_NA_mean <- med_specialty_mean[1,2]
+med_spec_other_mean <- mean(med_specialty_mean[2:73,2])
+
+#now we can do a t-test to see if the difference between the means is significant
+ttest_med <- t.test(med_specialty_mean[2:73,2], 
+                    alternative = "two.sided", mu = med_spec_NA_mean)
+ttest_med
+```
+
+  Null hypothesis of the t-test is: true mean is equal to 2.4038. The t-test result is significant at the 5% significance level - the difference between the readmission means for those observations that do have a medical specialty associated with them vs. those observations that do not, IS significant. This means we can reject the null hypothesis. Hence, this variable cannot be removed.  
+
+*Step 2: Miscellaneous Column Elimination*  
+  A) The max_glu_serum column does not have any missing values. However, the value of ‘None’ indicates that a measurement was not taken. A proportion table indicates that nearly 95% of the values are ‘none.’ Since a value of ‘None’ doesn’t indicate anything of significance, this variable can be eliminated. 
+```{r max_glu_serum Elimination, echo=FALSE}
+#A - max_glu_serum column
+prop.table(table(diabetes.df$max_glu_serum))
+diabetes.df <- diabetes.df %>% select(-c(max_glu_serum))
+```
+  
+  B) The A1Cresult column is similar – a value of ‘None’ indicates that a measurement was not taken. A proportion table indicates that 83% of observations did not have an A1c result taken. Since a value of ‘None’ doesn’t indicate anything of significance, this variable can also be eliminated. 
+```{r A1Cresult Elimination, echo=FALSE}
+#B - A1c result column
+prop.table(table(diabetes.df$A1Cresult))
+diabetes.df <- diabetes.df %>% select(-c(A1Cresult))
+```
+
+*Step 3: Replace ?s with NAs*  
+    Since the race column has 2% missing values, and the diag_3 column has 1%, I replaced the question marks with NA's in those columns for ease of analysis.
+```{r Race column, echo=FALSE}
+#A - RACE column, replacing "?" with NA to allow use of standard functions
+diabetes.df <- replace_with_na(diabetes.df, replace = list(race = c("?")))
+  #check to make sure it worked
+#table(diabetes.df$race)
+#sum(is.na(diabetes.df$race))
+
+#B - diag_3 column has some missing values
+diabetes.df <- replace_with_na(diabetes.df, replace = list(diag_3 = c("?")))
+ #check to make sure it worked
+#table(diabetes.df$diag_3)
+sum(is.na(diabetes.df$diag_3))
+```
+
+*Step 4: Convert data types for some of the most important columns*  
+    It is important to ensure the categorical variables are in proper format for analysis. Initially, many of the categorical variables were of the class “character.” However, for the purpose of exploratory analysis and modeling, they should be factors, or categorical variables. The following variables were converted to factor variables: race, gender, admission_type_id, discharge_disposition_id, admission_source_id, insulin, change, and diabetesMed.
+```{r Converting data types, echo=FALSE}
+diabetes.df$race <- as.factor(diabetes.df$race)
+diabetes.df$gender <- as.factor(diabetes.df$gender)
+diabetes.df$admission_type_id <- as.factor(diabetes.df$admission_type_id)
+diabetes.df$discharge_disposition_id <- as.factor(diabetes.df$discharge_disposition_id)
+diabetes.df$admission_source_id <- as.factor(diabetes.df$admission_source_id)
+diabetes.df$insulin <- as.factor(diabetes.df$insulin)
+diabetes.df$change <- as.factor(diabetes.df$change)
+diabetes.df$diabetesMed <- as.factor(diabetes.df$diabetesMed)
+```
+
+*Step 5: Drop Observation Rows*  
+  Observations with a gender of “Unknown/Invalid” were dropped. Even though these accounted for only three rows in the entire data set, a gender of "unknown/invalid" does not contribute much to the dataset and only increases the number of categories that a potential model would have to discern through.  
+```{r Drop Observation Rows, echo=FALSE}
+diabetes.df <- diabetes.df %>% filter(gender %in% c("Female", "Male"))
+```
+
+*Step 6: Reduce Number of Categories in 'Age' Variable*  
+  It is likely that age will be a predictor in whether a diabetes patient is readmitted. In the original data set, this variable is divided into ten categories. For ease of analysis, the number of categories was reduced to five. 
+```{r Age Variable - Category Reduction}
+  #new age categories
+age_factors <- c("0-19", "20-39", "40-59", "60-79", "80-99")
+  #recoding
+diabetes.df$age <- recode(diabetes.df$age, "[0-10)" = age_factors[1], 
+    "[10-20)" = age_factors[1], "[20-30)" = age_factors[2], 
+    "[30-40)" = age_factors[2], "[40-50)" = age_factors[3], 
+    "[50-60)" = age_factors[3], "[60-70)" = age_factors[4], 
+    "[70-80)" = age_factors[4], "[80-90)" = age_factors[5], 
+    "[90-100)" = age_factors[5]
+  )
+```
+
+*Step 7: Reduce Number of Medications in Data Set*  
+  The data set currently has 20+ medications, which is a bit excessive. I'd like to pick the top few medications that have the least proportion of 'No.'
+  
+```{r Medication Usage}
+  #creating new df with just the medications
+meds.df <- diabetes.df[, 20:42]
+
+  #counting proportion of 'No' in each column by calculating sum & 
+  #then dividing by 101763 (total # of observations)
+count.No.per.column <- ldply(meds.df, function(c) sum(c=="No")/101763)
+count.No.per.column <- count.No.per.column[order(count.No.per.column$V1),]
+count.No.per.column
+```
+  There are only 4 medications that have less than 90% No's. With more than 90% No's, it becomes difficult to derive meaningful insights from the data. So, I only kept insulin, metformin, glipizide and glyburide in the modeling data set.
+  
+```{r Elimination of Medications Columns, echo=FALSE}
+  #removing 19 medication columns by name
+diabetes.df <- diabetes.df %>% select(-c(pioglitazone, rosiglitazone, 
+      glimepiride, repaglinide, `glyburide-metformin`, nateglinide, acarbose, 
+      chlorpropamide, tolazamide, miglitol, tolbutamide, `glipizide-metformin`, 
+      troglitazone, `metformin-rosiglitazone`, acetohexamide, 
+      `glimepiride-pioglitazone`, `metformin-pioglitazone`, examide, citoglipton))
+```
+
+*Step 8: Group Medical Specialities*  
+  For the medical specialities with a handful of observations, I decided to group them into 'Other.' This is because if there are only a handful of categories for a certain variable, and the training and test set each do not have enough, the model produces an error, stating that there weren't enough observations.
+```{r Med Specialty Column}
+  #replacing question mark with NA
+diabetes.df$medical_specialty[diabetes.df$medical_specialty == "?"] <- NA
+
+spec_del <- count(diabetes.df, vars = "medical_specialty")
+spec_del <- subset(spec_del, subset=(spec_del$freq) < 20)
+
+diabetes.df$medical_specialty <- fct_collapse(diabetes.df$medical_specialty, 
+    'Other' = c(spec_del$medical_specialty))
+
+diabetes.df$medical_specialty <- as.factor(diabetes.df$medical_specialty)
+```
+
+*Step 9: Group Admission Source IDs*  
+ Similar to above, if an admission_source_id factor had fewer than 20 observations I decided to group it into 'Other.' 
+```{r Admission Source Column}
+diabetes.df$admission_source_id <- as.factor(diabetes.df$admission_source_id)
+
+adm_del <- count(diabetes.df, vars = "admission_source_id")
+adm_del <- subset(adm_del, subset=(adm_del$freq) < 20)
+
+diabetes.df$admission_source_id <- fct_collapse(diabetes.df$admission_source_id, 
+            'Other' = c("8", "10", "11", "13", "14", "22", "25"))
+```
+
+*Step 10: Convert Response Variable*  
+  There are currently 3 outcome variables. I want to reduce to a binary outcome in the hopes that it will improve classification accuracy. In addition, I am mostly interested in whether or not a patient ends up readmitted in less than 30 days. For my analysis, if a patient is readmitted in more than 30 days, it is equivalent to the patient not being readmitted. This justifies the collapsing of the ">30" outcome possibility into the "No" category.
+```{r Convert Response Variable}
+  #converting response variable so only 2 outcomes. But first, need to filter 
+  #out the 3 rows we deleted from original dataframe
+original_df2 <- original_df %>% filter(gender %in% c("Female", "Male"))
+diabetes.df$readmitted <- as.factor(original_df2$readmitted)
+diabetes.df$readmitted <- fct_collapse(diabetes.df$readmitted, 
+                                       '>30 or No' = c(">30", "NO"))
+```
+
+**Part D: Exploratory Data Analysis**  
+  
+*Part I: Categorical Variables*  
+   I first explored the categorical variables in this data set.  
+  1) The below bar plot of the age variable shows slight variation in the age distribution between the readmission categories. But the variation is not as great as anticipated.
+  
+```{r Bar Plot - Age, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$readmitted, diabetes.df$age), margin = 2)
+ggplot(diabetes.df, aes(x=diabetes.df$readmitted, fill=diabetes.df$age)) + 
+  coord_flip() + geom_bar(position = "fill", width=0.7) + 
+  xlab("Readmitted") + ylab("Proportion") +
+  labs(title="Plot of readmission by Age", fill = "Age") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+  2) A bar plot of the gender variable shows nearly identical variation between the readmission categories. It doesn't look like this will be a strong predictor variable in any model.
+  
+```{r Bar Plot - Gender, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$readmitted, diabetes.df$gender), margin = 1)
+ggplot(diabetes.df, aes(x=diabetes.df$readmitted, fill=diabetes.df$gender)) +
+  geom_bar(position = "fill", width=0.7) +
+  xlab("Readmitted") + ylab("Proportion") +
+  labs(title="Plot of readmission by Gender", fill = "Gender") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+  3) From a cursory inspection, a bar plot of the race variable shows that the two races with even slight variation are: Asian & Caucasian. Race will likely be included in the model.
+  
+```{r Bar Plot - Race, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$readmitted, diabetes.df$race), margin = 1)
+ggplot(diabetes.df, aes(x=diabetes.df$readmitted, fill=diabetes.df$race)) + 
+  coord_flip() + geom_bar(position = "fill", width=0.7) + 
+  xlab("Readmitted") + ylab("Proportion") +
+  labs(title="Plot of readmission by Race", fill = "Race") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), 
+        axis.title.y = element_text(size=10))
+```
+
+  4) A bar plot of the insulin variable shows that for patients who were readmitted within 30 days, there is a slightly higher proportion of patients for whom insulin dosage increased, as compared to patients who were not readmitted within 30 days.
+  
+```{r Bar Plot - Insulin, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$readmitted, diabetes.df$insulin))
+ggplot(diabetes.df, aes(x=diabetes.df$readmitted, fill=diabetes.df$insulin)) +
+  coord_flip() + geom_bar(position = "fill", width=0.7) + xlab("Readmitted") + 
+  ylab("Proportion") + labs(title="Plot of readmission by Insulin", fill = "Insulin") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+  5) A bar plot of the med_changed variable indicates that for patients who were readmitted within 30 days, there was a slightly higher chance that they DID have their medication changed.
+  
+```{r Bar Plot - Med Changed, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$readmitted, diabetes.df$change), margin = 1)
+ggplot(diabetes.df, aes(x=diabetes.df$readmitted, fill=diabetes.df$change)) + 
+  geom_bar(position = "fill", width=0.7) +
+  xlab("Readmitted") + ylab("Proportion") + 
+  labs(title="Plot of readmission by \n Whether Med Changed", fill = "Change") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+*Part II: Numerical Variables*  
+  1) A box plot of the time_in_hospital variable shows that patients who were readmitted within 30 days did not have a significantly longer hospital stay as compared to patients who were not readmitted.
+  
+```{r boxplot time in hosp, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$readmitted, diabetes.df$time_in_hospital), margin = 1)
+#summary(diabetes.df$time_in_hospital)
+ggplot(data = diabetes.df, mapping = aes(x = diabetes.df$readmitted, 
+                y = diabetes.df$time_in_hospital)) +
+  geom_boxplot() + xlab("Readmission Status") + ylab("Days in Hospital") +
+  labs(title="Time in Hospital\n by Readmission Status") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+  2) Box plot of number of medications doesn't indicate a noticeable difference between the categories.
+  
+```{r boxplot number of medications, echo = FALSE, fig.align = "center"}
+#summary(diabetes.df$num_medications)
+ggplot(data = diabetes.df, mapping = aes(x = diabetes.df$readmitted, 
+                y = diabetes.df$num_medications)) +
+  geom_boxplot() + xlab("Readmission Status") + ylab("Number of Medications") +
+  labs(title="Number of Medications\n by Readmission Status") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+  3) Box plot of number of inpatient visits indicates that patients who were readmitted in less than 30 days have a higher mean as compared to the non-readmitted patients.
+  
+```{r boxplot number of inpatient visits, echo = FALSE, fig.align = "center"}
+means <- aggregate(diabetes.df$number_inpatient ~  diabetes.df$readmitted, diabetes.df, mean)
+ggplot(data = diabetes.df, 
+       mapping = aes(x = diabetes.df$readmitted, 
+                     y = diabetes.df$number_inpatient)) +
+  geom_boxplot() + 
+  stat_summary(fun.y = mean, geom="point",colour="darkred", size=3) +
+  xlab("Readmission Status") + ylab("Number of Inpatient Visits") +
+  labs(title="Number of Inpatient Visits\n by Readmission Status") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+  4) Box plot of number of diagnoses. Readmitted patients have a slightly higher number of diagnoses.
+  
+```{r boxplot number of diagnoses, echo = FALSE, fig.align = "center"}
+#prop.table(table(diabetes.df$number_diagnoses, diabetes.df$readmitted), margin = 1)
+means <- aggregate(diabetes.df$number_diagnoses ~  diabetes.df$readmitted, diabetes.df, mean)
+
+ggplot(data = diabetes.df, 
+       mapping = aes(x = diabetes.df$readmitted, 
+                     y = diabetes.df$number_diagnoses)) +
+  geom_boxplot() + 
+  stat_summary(fun.y = mean, geom="point",colour="darkred", size=3) +
+  xlab("Readmission Status") + ylab("Number of Diagnoses") +
+  labs(title="Number of Diagnoses\n by Readmission Status") +
+  theme(plot.title = element_text(size=12, face="italic", hjust=0.5), 
+        axis.title.x = element_text(size=10), axis.title.y = element_text(size=10))
+```
+
+**Part E: Empirical Data Analysis**  
+***Part I: Pre-modeling Data Analysis***  
+***1. Readmission Frequency***  
+  Based on the exploratory data analysis, I was a little concerned about whether any modeling technique would produce significant results. So, I split the data in different ways to see if there might be another hypothesis question worth exploring. For instance, one question that came to mind was: For all the patient encounters that resulted in a readmission within less than 30 days, were there duplicate patients? Put another way, were there patients who had hospital readmissions in less than 30 days, multiple times? If so, perhaps a question worth exploring could be: what are the explanatory variables that influence whether a patient has repeated hospital readmissions in less than 30 days?  
+
+```{r Pre-modeling}
+  #distinct patient IDs
+diabetes_pts <- diabetes.df %>% select(c(patient_nbr, readmitted))
+
+  #only want pts who appear multiple times
+duplicate_pts <- diabetes_pts[duplicated(diabetes_pts$patient_nbr)|duplicated(diabetes_pts$patient_nbr, fromLast=TRUE),]
+
+  #then, filter to select those pts who were readmitted in less than 30 days
+dup_pts_rRLT30 <- duplicate_pts %>% filter(readmitted %in% c("<30"))
+
+num_readmits <- dup_pts_rRLT30 %>% group_by(patient_nbr, readmitted)
+
+readmit_freq <- count(dup_pts_rRLT30)
+#readmit_freq
+sum(readmit_freq$freq > 1)
+```
+
+  There were only 1,539 records with a frequency of more than 1. I decided that this was not enough data to produce a reliable model. Instead, I deemed it more statistically sound to continue modeling with a variation of the original data set.  
+
+***2: Minority Class Oversampling***  
+
+  Since the cost of missing the minority class (which is the class of interest) is high, we want to correctly identify as many of the "less than 30 days" readmission cases as possible. This is where the hospital is penalized, and also incurs greater cost.  
+  
+  Based on the exploratory analysis, from cursory visual inspection, it doesn't look like there are any obvious indicator variables that would be strong candidates for a predictive model. Going back to the data, we see that this could be because we have an unbalanced classification problem. In other words, there is an uneven proportion of cases available for each class. Only ~11% of observations belong to the class of interest. Thus, I decided to oversample the minority class / undersample the majority class. I made sure that the modeling data set has a 50/50 split between patients readmitted in less than 30 days vs. all other patients. This technique also allows me to take into account the misclassification costs. The cost of misidentifying a patient likely to be readmitted is much greater than the cost of misidentifying a patient not likely to be readmitted.
+
+```{r Oversample Minority Class, echo = FALSE}
+set.seed(123)
+  #first, let me remove the diagnoses columns, since they will 
+  #not be used in any future models
+diabetes.df <- diabetes.df %>% select(-c(diag_1, diag_2, diag_3))
+
+  #splitting into two data sets - majority & minority. taking random sample from majority.
+random_majority_df <- diabetes.df[sample(nrow(diabetes.df), 11357), ]
+#View(random_majority_df)
+
+minority_df <- diabetes.df[diabetes.df$readmitted == '<30', ]
+#View(minority_df)
+
+    #now, we will bind these two to create a new data set for modeling purposes
+df.modeling <- rbind(random_majority_df, minority_df)
+```
+
+***Part II: Modeling***  
+
+***Model 1: Principal Component Analysis***
+
+At the moment, there are still 43 indicator variables. To produce a meaningful model, I should try to decrease the number of variables. Principal Component Analysis is a useful technique for determining which numerical variables are most important. In this technique, we aim for dimension reduction by trying to find a few variables that are weighted linear combinations of the original variables, yet retain the majority of the information from the dataset. This method is also useful since collinearity between some of the numerical variables is a strong possibility. For instance, there could be high correlation between number_medications and number_outpatient - the more medications a patient is on, the higher their number of outpatient visits likely are. PCA produces linear combinations of the independent variables that account for this.
+
+One of the most important parts of running a PCA is scaling the variables, if necessary. If not scaled, one variable can have an outsized influence on the results simply due to the fact that it represents a measure that has high numerical values. From visual inspection of the data, it was clear that num_lab_procedures had very high numerical values. Hence, I made sure to scale the data before running the model.
+```{r PCA}
+  #selecting just the numeric variables from dataset
+df.model.PCA <- df.modeling %>% select(c(time_in_hospital, num_lab_procedures, num_procedures,
+   num_medications, number_outpatient, number_emergency, number_inpatient, number_diagnoses))
+  #now run PCA. important to scale!
+df.PCA.model.results <- prcomp(df.model.PCA, scale. = T)
+df.PCA.model.results
+summary(df.PCA.model.results)
+```
+
+  Now let's visualize the influence each PC has.
+```{r PCA Viz}
+fviz_eig(df.PCA.model.results)
+```
+  We see that none of the eight principal components (PC) make an outweighted contribution towards the variability in the dataset. The first PC, which makes the most significant contribution and is the one that minimizes the sum-of-squared perpendicular distances from the line, only contributes ~23% of the variation. In this case, the first PC is most affected by the number of medications, the second PC by number_inpatient, the third PC by number_outpatient, the fourth by num_procedures, and so on. Thus, the top 4 most important numerical variables are the ones the PC emphasizes.
+  
+  The visualization also indicates that besides the first two components, the other components each contribute ~6-12% towards the variation. Since the the first two components combined only account for 40% of the variation, a high proportion of information would be lost if we simply eliminated the other components.
+  
+  The above results make it clear that 7 of the 8 PCs must be included to account for more than 90% of the variation in the model. Thus, the above results did not really help in reducing the number of numerical variables to ultiamtely include in the model.  
+
+***Model 2: Naive Bayes***  
+  Since PCA looked just at the numerical variables, for the second model, I chose Naive Bayes, which is a good model for categorical variables. However, since the model is best suited for categorical variables, I binned the numerical variables and converted them into categorical variables.
+
+  One important model assumption that must be kept in mind is that Naive Bayes assumes that all the predictor variables are independent of each other. In reality, this is likely not the case. For instance, num_medications is likely related to time_in_hospital - the longer the hospital stay, the more medications that are likely to be administered.
+  
+```{r NB, part 1}
+  #new modeling data set for Naive Bayes
+df.model.NB <- df.modeling
+
+#numerical variables must be converted to categorical
+  #1) time_in_hospital. bins aren't exact, but it's the closest we can 
+    #get & also minimize # of bins
+table(df.model.NB$time_in_hospital)
+break_pts <- c(-Inf, 3, 6, 9, Inf)
+names <- c("1-3", "4-6", "7-9", "10-14")
+df.model.NB$time_in_hospital.cat <- cut(df.model.NB$time_in_hospital, 
+      breaks = break_pts, labels = names)
+
+  #2) number_outpatient. majority of patients did not have outpatient visit, 
+    #so only splitting into 2 categories
+#table(df.model.NB$number_outpatient)
+break_pts <- c(-Inf, 0, Inf)
+names <- c("0", "1+")
+df.model.NB$num_outpt.cat <- cut(df.model.NB$number_outpatient, 
+  breaks = break_pts, labels = names)
+
+  #3) number_inpatient. again, majority of patients did not have inpatient 
+      #visit. but since there is slightly wider dispersion, dividing into 
+      #3 (unequal) bins.
+#table(df.model.NB$number_inpatient)
+break_pts <- c(-Inf, 0, 2, Inf)
+names <- c("0", "1-2", "3+")
+df.model.NB$num_inpt.cat <- cut(df.model.NB$number_inpatient, 
+    breaks = break_pts, labels = names)
+
+  #4) number_diagnoses. ~50% of pts have 9+ diagnoses. splitting into 3 bins, 
+      #20%, 30%, 50%
+#table(df.model.NB$number_diagnoses)
+break_pts <- c(-Inf, 5, 8, Inf)
+names <- c("0-5", "6-8", "9+")
+df.model.NB$num_diag.cat <- cut(df.model.NB$number_diagnoses, 
+    breaks = break_pts, labels = names)
+
+  #5) number_emergency. vast majority of pts didn't have emergency visit. so 
+      #only splitting into 2 categories.
+#table(df.model.NB$number_emergency)
+break_pts <- c(-Inf, 0, Inf)
+names <- c("0", "1+")
+df.model.NB$num_emer.cat <- cut(df.model.NB$number_emergency, 
+    breaks = break_pts, labels = names)
+
+  #6) num_procedures. the range is 0 - 6, so let's just factor, & not bin.
+break_pts <- c(-Inf, 1, 4, Inf)
+names <- c("0-1", "2-4", "5-6")
+df.model.NB$num_proc.cat <- cut(df.model.NB$num_procedures, 
+    breaks = break_pts, labels = names)
+
+  #7) num_lab_procedures. since range is wide, I create 5 (rather than 4) bins
+      #use rbin_quantiles to see where to split to get ~equal size bins
+#table(df.model.NB$num_lab_procedures)
+bins <- rbin_quantiles(df.model.NB, readmitted, num_lab_procedures, 5)
+bins
+```
+  
+  Bin cut points for num_lab_procedures should be: 28, 40, 49, 60.
+```{r NB, part 2}
+break_pts <- c(-Inf, 28, 40, 49, 60, Inf)
+names <- c("1-28", "29-40", "41-49", "50-60", "61+")
+df.model.NB$num_lab_procs.cat <- cut(df.model.NB$num_lab_procedures, 
+    breaks = break_pts, labels = names)
+
+  #8) num_medications. let's keep 4 bins the standard for this data set
+bins <- rbin_quantiles(df.model.NB, readmitted, num_medications, 4)
+bins
+```
+  Bin cut points should be: 11, 15, 21
+
+```{r NB, part 3}
+break_pts <- c(-Inf, 11, 15, 21, Inf)
+names <- c("1-11", "12-15", "16-21", "22+")
+df.model.NB$num_meds.cat <- cut(df.model.NB$num_medications, 
+    breaks = break_pts, labels = names)
+
+  #also removing the numerical columns themselves, just for cleanliness' sake
+df.model.NB <- df.model.NB %>% select(-c("time_in_hospital", "num_lab_procedures", 
+    "num_procedures", "num_medications", "number_outpatient", 
+    "number_emergency", "number_inpatient", "number_diagnoses"))
+```
+  
+  Now I run the Naive Bayes model itself, after splitting into train & test data sets.
+
+```{r Training & Test Data Sets - NB, echo=FALSE}
+set.seed(123)
+train.index <- createDataPartition(df.model.NB$readmitted, p=0.7, list = FALSE)
+train.df.nb <- df.model.NB[train.index,]
+test.df.nb <- df.model.NB[-train.index,]
+```
+
+```{r NB model}
+set.seed(123)
+diabetes.nb1 <- naiveBayes(readmitted ~ race + gender + age + admission_type_id + 
+      discharge_disposition_id + admission_source_id + metformin + glipizide + 
+      glyburide + insulin + change + diabetesMed + time_in_hospital.cat + 
+      num_outpt.cat + num_inpt.cat + num_diag.cat + num_emer.cat + num_proc.cat +
+      num_lab_procs.cat,
+    data = train.df.nb)
+diabetes.nb1
+```
+  
+  The interpretation of the Naive Bayes model is uniform. For instance, the num_emer.cat variable, amongst patients who were readmitted in less than 30 days, 83.3% of them did not have an emergency room visit in the past year, while the other 16.7% of patients did have at least one emergency room visit. Similarly, amongst patients who were readmitted in greater than 30 days or not readmitted at all, 89.4% of them did not have emergency room visit in the past year, while the other 10.6% did. The probabilities represent: P(X | Y). Given Y, what is the probability of X?
+  
+  Now, I evaluate the accuracy of both the training and test data sets.
+  
+Training Data Confusion Matrix:
+```{r NB model - Model Eval - Train Data, echo=FALSE}
+  #Assessing TRAINING data set
+# probabilities
+pred.prob.nb1 <- predict(diabetes.nb1, newdata = train.df.nb, type = "raw")
+  # class membership
+pred.class.nb1 <- predict(diabetes.nb1, newdata = train.df.nb)
+
+train.gains <- data.frame(actual = train.df.nb$readmitted, 
+        predicted = pred.class.nb1, pred.prob.nb1)
+
+  # Confusion Matrix - training data
+confusionMatrix(pred.class.nb1, train.df.nb$readmitted)
+```
+
+Test Data Confusion Matrix:
+```{r NB model - Model Eval - Test Data, echo=FALSE}
+  #Assessing TEST data set
+# probabilities
+pred.prob.nb2 <- predict(diabetes.nb1, newdata = test.df.nb, type = "raw")
+  # class membership
+pred.class.nb2 <- predict(diabetes.nb1, newdata = test.df.nb)
+
+test.nb.gains <- data.frame(actual = test.df.nb$readmitted, 
+        predicted = pred.class.nb2, pred.prob.nb2)
+
+  # Confusion Matrix - test data
+confusionMatrix(pred.class.nb2, test.df.nb$readmitted)
+```
+  
+  The above Naive Bayes model only resulted in a 62.35% accuracy rate for the training data, and 61.5% for the test set. In addition, the sensitivity rate for the test is a decent 69.14%. Below is a lift chart to visualize the performance of this model.
+  
+```{r Naive Bayes - Lift Chart, warning=FALSE, echo=FALSE}
+gain <- gains(test.nb.gains$'X.30', test.nb.gains$'X.30.or.No', groups = dim(test.nb.gains)[1])
+plot(c(0, gain$cume.pct.of.total*sum(test.nb.gains$X.30)) ~c(0,gain$cume.obs),
+      xlab = "# cases", ylab = "Cumulative", type="l")
+lines(c(0,sum(test.nb.gains$X.30)) ~ c(0,dim(test.nb.gains)[1]), col="blue", lty=2)
+```
+
+  The lift chart indicates that the model does not perform much better than random. A 'good' model would have a lift chart with a line to the far left corner of the naive line.
+
+  I then ran another iteration of Naive Bayes, this time with fewer predictor variables, since 19 is quite a few. The only predictor variables I retaine are: race, age, adminission_type_id, metformin, time_in_hospital category, and num_inpatient category.
+```{r NB model - 2nd iteration, warning=FALSE}
+set.seed(123)
+diabetes.nb2 <- naiveBayes(readmitted ~ race + age + admission_type_id + 
+    metformin + time_in_hospital.cat + num_inpt.cat, data = train.df.nb)
+diabetes.nb2
+```
+
+Training Data Confusion Matrix:
+```{r NB model - 2nd iteration - Model Eval - Training Data, warning=FALSE, echo=FALSE}
+  #Assessing TRAINING data set
+# probabilities
+pred.prob3 <- predict(diabetes.nb2, newdata = train.df.nb, type = "raw")
+  # class membership
+pred.class3 <- predict(diabetes.nb2, newdata = train.df.nb)
+
+train.gains2 <- data.frame(actual = train.df.nb$readmitted, 
+    predicted = pred.class3, pred.prob3)
+
+  # Confusion Matrix - training data
+confusionMatrix(pred.class3, train.df.nb$readmitted)
+```
+
+Test Data Confusion Matrix:
+```{r NB model - 2nd iteration - Model Eval - Test data, warning=FALSE, echo=FALSE}
+  #Assessing TEST data set
+# probabilities
+pred.prob4 <- predict(diabetes.nb2, newdata = test.df.nb, type = "raw")
+  # class membership
+pred.class4 <- predict(diabetes.nb2, newdata = test.df.nb)
+
+test.gains2 <- data.frame(actual = test.df.nb$readmitted, 
+    redicted = pred.class4, pred.prob4)
+
+  # Confusion Matrix - test data
+confusionMatrix(pred.class4, test.df.nb$readmitted)
+```
+
+  The absolute accuracies are lower than they were in the first iteration, as is the sensitivity, at 68.8% (versus the first iteration, where it was 69.14%).
+
+```{r Naive Bayes 2nd iteration - Lift Chart, warning=FALSE, echo=FALSE}
+gain2 <- gains(test.gains2$'X.30', test.gains2$'X.30.or.No', groups = dim(test.gains2)[1])
+plot(c(0, gain2$cume.pct.of.total*sum(test.gains2$X.30)) ~c(0,gain2$cume.obs),
+      xlab = "# cases", ylab = "Cumulative", type="l")
+lines(c(0,sum(test.gains2$X.30)) ~ c(0,dim(test.gains2)[1]), col="blue", lty=2)
+```
+
+  Upon eliminating 13 predictors and only keeping 6, the accuracy on the test data set decreased to 58.36%, as did the sensitivity. Thus, between these two iterations of Naive Bayes, the first is the preferred option.
+
+***Model 3: Support Vector Machine (SVM)***
+
+  The third model I explore is Support Vector Machines (SVM). In general, this is a powerful method for classification because it has the capacity to handle non-linear relationships between the predictor variables and the target variable. The model aims to create a linear, radial, polynomial or sigmoidal hyperplane that best disrciminates between the two target variables (i.e. create the largest distance between the support vectors and the hyperplane).
+  
+  First, I recreating training & test data sets for the SVM model. For this model, there's no need to pre-process the dataset too much because SVM can handle both numerical & categorical variables. We simply have to omit the NA's, as SVM is unable to handle missing data efficiently.
+
+```{r SVM Preprocessing}
+  #new modeling data set for SVM. removing diabetesMed column, 
+  #since that info is already captured in the 4 medication columns.
+df.model.SVM <- df.modeling %>% select(-c(diabetesMed))
+
+  #also omitting NA's, because SVM can't handle NA's
+df.model.SVM <- na.omit(df.model.SVM)
+```
+
+```{r Training & Test Data Sets - SVM, echo=FALSE}
+set.seed(123)
+train.index <- createDataPartition(df.model.SVM$readmitted, p=0.7, list = FALSE)
+train.df.svm <- df.model.SVM[train.index,]
+test.df.svm <- df.model.SVM[-train.index,]
+```
+
+  All iterations of SVM will include all 19 indicator variables. The first iteration is for a linear kernel. I use the SVM function, which automatically scales the variables.
+```{r SVM - Model 1 - Linear}
+svm.linear <- svm(readmitted ~ ., data = train.df.svm, kernel = "linear")
+summary(svm.linear)
+```
+
+Test data accuracy:
+```{r SVM 1 - Linear - Model Eval, warning=FALSE, echo=FALSE}
+ #Assessing TEST data set
+# probabilities
+pred.svm1 <- predict(svm.linear, newdata = test.df.svm)
+
+  # Confusion Matrix - test data
+confusionMatrix(pred.svm1, test.df.svm$readmitted)
+```
+
+  This model results in a 63.45% accuracy, with a sensitivity of 63.24%. I next run more iterations, with different kernels, to see if we can get improved results.
+    
+  The second iteration of the SVM model implements a radial kernel.
+
+```{r SVM - Model 2 - Radial}
+svm.radial <- svm(readmitted ~ ., data = train.df.svm, kernel = "radial")
+summary(svm.radial)
+```
+
+Test data accuracy:
+```{r SVM 2 - Radial - Model Evaluation, warning=FALSE, echo=FALSE}
+ #Assessing TEST data set
+# probabilities
+pred.svm2 <- predict(svm.radial, newdata = test.df.svm)
+
+  # Confusion Matrix - test data
+confusionMatrix(pred.svm2, test.df.svm$readmitted)
+```
+  With the radial kernel, we get a slightly lower accuracy at 62.88%. But, more importantly, the range between the sensitivity and specificity increases significantly. While the sensitivity increased to 69.37%, the specificity deteriorated to 55.11%. If the goal is the have a model with a high sensitivity, since patients who are readmitted in less than 30 days are costly, then this is a reasonable model.  
+  
+  The third iteration of the SVM model implements a polynomial kernel.
+
+```{r SVM - Model 3 - Polynomial}
+svm.poly <- svm(readmitted ~ ., data = train.df.svm, kernel = "polynomial")
+summary(svm.poly)
+```
+
+Test data accuracy:
+```{r SVM 3 - Polynomial - Model Evaluation, warning=FALSE, echo=FALSE}
+ #Assessing TEST data set
+# probabilities
+pred.svm3 <- predict(svm.poly, newdata = test.df.svm)
+
+svm_predict3 <- ifelse(pred.prob3>0.5,1,0)
+svm_predict3 <- as.factor(svm_predict3)
+
+  # Confusion Matrix - test data
+confusionMatrix(pred.svm3, test.df.svm$readmitted)
+```
+  This kernel produces a model with a lower accuracy than both the first and second iterations. However, the sensitivity is strikingly high, at 99.94%. Unsurprisingly, the specificity is nearly 0%. Even if our goal is to have a model with a high sensitivity, we need for the model to also have some specificity power. Clearly, this model is unable to predict which patients will not be readmitted. Hence, this is not a viable model.
+  
+  The last iteration of the SVM model implements a sigmoid kernel.
+
+```{r SVM - Model 4 - Sigmoid}
+svm.sig <- svm(readmitted ~ ., data = train.df.svm, kernel = "sigmoid")
+summary(svm.sig)
+```
+
+Test data accuracy:
+```{r SVM 4 - Sigmoid - Model Evaluation, warning=FALSE, echo=FALSE}
+  #Assessing TEST data set
+# probabilities
+pred.svm4 <- predict(svm.sig, newdata = test.df.svm, type = "raw")
+
+  # Confusion Matrix - test data
+confusionMatrix(pred.svm4, test.df.svm$readmitted)
+```
+
+  This sigmoid kernel model isn't strikingly different from the first or second iterations. The accuracy is still in the low 60% range, and the range between the sensitivity and specificity is about the same as it was with the radial kernel. If the hospital wishes to place nearly equal emphasis on readmitted vs. not readmitted patients, this model is a good candidate.
+  
+  Due to computer memory limitations, a hyperparameter optimization model was not possible. But that is one area in which this model coule be improved, given the appropriate resources. If I had been able to optimize the model, I would have had the option to choose amongst cost values that represent the tradeoff between minimizing the training set error and maximizing the margins.
+
+***Model 4: Logistic Regression***  
+
+  For logistic regression, I revert back to using the entire data set. This is because with the smaller, oversampled data set, there were some categories missing for some columns. This led to errors when trying to predict the probability of a new observation falling into the 'less than 30 day readmission' category. Hence, I went back and created the logistic regression data set from the original (but processed) dataset. 
+
+```{r Logistic Regression Preprocessing}
+  #new modeling data set for Logistic regression. removing diabetesMed column
+df.model.log <- diabetes.df %>% select(-c(patient_nbr ,diabetesMed))
+
+  #creating new variable that takes on value of 1 if readmitted in <30 days, and 0 otherwise
+df.model.log$isReadmit = 1 * (df.model.log$readmitted == "<30")
+
+  #need to factorize age variables
+df.model.log$age <- as.factor(df.model.log$age)
+
+  #dropping 'readmitted' column, bc I created a new binary column to capture that
+df.model.log <- df.model.log %>% select(-c(readmitted))
+
+diabetes.df$race[diabetes.df$race == "?"] <- NA
+
+  #disch to delete
+dis_keep <- count(df.model.log, vars = "discharge_disposition_id")
+dis_keep <- subset(dis_keep,subset=(dis_keep$freq>20))
+df.model.log <- df.model.log %>% filter(discharge_disposition_id %in% dis_keep$discharge_disposition_id)
+
+df.model.log <- na.omit(df.model.log)
+```
+
+```{r Log Reg, Training & Test Data Sets, echo=FALSE}
+set.seed(123)
+train.index <- createDataPartition(df.model.log$isReadmit, p=0.7, list = FALSE)
+train.df.log <- df.model.log[train.index,]
+test.df.log <- df.model.log[-train.index,]
+```
+
+```{r Log Reg Model, warning=FALSE}
+logit.reg <- glm(isReadmit ~., data = train.df.log, family = "binomial")
+#options(scipen = 999)
+summary(logit.reg)
+  #extremely long output, so I excluded the printing!
+```
+
+  Logistic regression models are usually more interpretable when looking at the odds, so let's calculate the odds based on the probabilities. However, I only display the categories that have a probability of less than 0.01. In other words, I am only interested in the categories that had a less than 1% chance of obtaining the values they did, simply due to random error. This resulted in 27 rows - these are the variable categories that are most significant and most likely contribute to the readmission differences we see.
+
+```{r Log Reg Odds, warning=FALSE}
+logreg.odds <- round(data.frame(summary(logit.reg)$coefficients, 
+    odds = exp(coef(logit.reg))), 5)
+  #only selecting rows that are significant, based on alpha of 0.01
+logreg.odds <- logreg.odds[logreg.odds $Pr...z.. <= 0.01,]
+logreg.odds
+```
+
+  In the above output, I take a very numeric approach to interpreting the data. I cannot interpret the estimates & standard errors in isolation. What's most important is the z-value. Whenever I see a high absolute z-value, the correspoding probability is lower, as compared to when I see a low absolute z-value. This is because, the higher the z-value, the further away the value is from the reference variable. The further away from the reference, the lower the probability, because there's a lower chance of obtaining the estimate I did simply by chance. If I use the standard alpha of 0.05, then only the rows with a probability of less than 0.05 are considered significant.
+  
+Then, for the rows with a signficant p-value, I can interpret the odds column as follows:
+  
+  1) Numerical variable: Let's take number_inpatient as the example. The probability is 0.00000, so it is definitely significant. The odds are 1.3, which means that for every 1 unit increase in number_inpatient, the odds of a patient being readmitted increase by a multiplicative factor of 1.3. The odds were obtained by calculating the following: e^(0.26425). In other words, to obtain the odds, I took the natural log of the coefficient associated with this variable.
+
+  2) Categorical variable: Let's take discharge_disposition_id13 as the example. Although not clear from the output, I can simply refer back to the original data set & the original categories for each column to infer what the reference variable is. In this case, the dropped reference was discharge_disposition_id1, which means the patient was discharged to home. The odds of a patient who was discharged to a hospice being readmitted to the hospital in less than 30 days is 1.71, as compared to a patient who was discharged home. This makes sense - a patient who is discharged to a hospice is already in a formal patient care setting, and therefore is already relatively unhealthy, and more likely to be readmitted to a hospital.
+    
+  One interesting point: when the coefficient estimate is positive, the odds are greater than 1. When the coefficient estimate is negative, the odds are less than 1.
+
+ To evaluate model accuracy, I created the confusion matrix below.
+```{r Log Reg Prediction & Confusion Matrix}
+  #predicting on test data set
+log.predict.test <- predict(logit.reg, newdata = test.df.log, 
+                            type = "response")
+
+  # Confusion Matrix - test data
+log_predict1 <- ifelse(log.predict.test>0.5,1,0)
+
+log_predict1 <- as.factor(log_predict1)
+isReadmit <- as.factor(test.df.log$isReadmit)
+
+confusionMatrix(log_predict1, isReadmit, positive = "1")
+```
+
+  While the accuracy of this model is high at 89.23%, the sensitivity is only 2.4%, which renders the model useless for predicting whether or not a patient ends up readmitted. Still, below is a (misleading) lift chart.
+
+```{r Log Reg Gains, warning=FALSE, echo=FALSE}
+gain <- gains(test.df.log$isReadmit, log.predict.test, groups = length(log.predict.test))
+  
+  #Lift Chart
+plot(c(0, gain$cume.pct.of.total*sum(test.df.log$isReadmit)) ~c(0,gain$cume.obs),
+      xlab = "# cases", ylab = "Cumulative", type="l")
+lines(c(0,sum(test.df.log$isReadmit)) ~ c(0,dim(test.df.log)[1]), col="blue", lty=2)
+```
+
+  Let's run a second iteration of the logistic regression model. This time, let's use fewer predictor variables, but also create a couple of interaction variables. The interaction variables allow further refinement of the effect each of the individual variables has on the readmission probability. I created interaction variables for:
+  
+  1) race and gender - it is often hypothesized in the literature that females belonging to a minority race are at increased economic and health disadvantages.  
+  2) number_inpatient and number_emergency - it makes intuitive sense that the greater the number of inpatient visits a patient has had, the less likely they are to have an emergency hospital visit. If they have a high number of inpatient visits, they likely receive all the care they need during those visits, making an emergency visit less of a possibility.
+
+```{r Log Reg Model - 2nd iteration}
+options(max.print=1000)
+logit.reg2 <- glm(isReadmit ~ age + admission_type_id + time_in_hospital +
+                    num_medications + number_emergency + number_diagnoses +
+                    (race * gender) + (number_inpatient * number_emergency) +
+                    (time_in_hospital * number_emergency),
+                  data = train.df.log, family = "binomial")
+options(scipen = 999)
+summary(logit.reg2)
+```
+
+```{r Log Reg Odds - 2nd iteration}
+logreg.odds2 <- round(data.frame(summary(logit.reg2)$coefficients, odds = exp(coef(logit.reg2))), 5)
+  #only selecting the rows that are significant, based on an alpha of 0.01
+logreg.odds2 <- logreg.odds2[logreg.odds2$Pr...z.. <= 0.01,]
+logreg.odds2
+```
+
+  Confusion matrix of test data set:
+```{r Log Reg Prediction - 2nd iteration}
+  #predicting on test data set
+log.predict.test2 <- predict(logit.reg2, newdata = test.df.log, type = "response")
+
+  # Confusion Matrix - test data
+log_predict2 <- ifelse(log.predict.test2>0.5,1,0)
+
+log_predict2 <- as.factor(log_predict2)
+isReadmit2 <- as.factor(test.df.log$isReadmit)
+
+confusionMatrix(log_predict2, isReadmit2, positive = "1")
+```
+
+  Unfortunately, we see a decrease in the sensitivity down to 1.65% when using fewer predictor variables. Hence, logistic regression is definitely not a candidate for the final model.
+
+***Model 5: Decision Tree***  
+  
+  The last model I will implement is a classification tree, which is a simple, but powerful algorithm. One of the major benefits of this model is that it can handle missing data, so there is no need to omit NA's. However, one of the disadvantages of this model is that it is easy to overfit it to the training data. Thus, I will keep a special eye on the training vs. test accuracies.
+
+```{r Tree Preprocessing, echo=FALSE}
+ df.model.tree <- df.modeling %>% select(-c(diabetesMed))
+
+  #editing response column
+df.model.tree$readmitted <- as.factor(df.model.tree$readmitted)
+      #creating new variable that takes on value of 1 if readmitted in <30 days, and 0 otherwise
+df.model.tree$isReadmit = 1 * (df.model.tree$readmitted == "<30")
+
+  #dropping 'readmitted' column, bc I created a new binary column to capture that
+df.model.tree <- df.model.tree %>% select(-c(readmitted))
+```
+
+```{r Training & Test Data Sets - Decision Tree, echo=FALSE}
+set.seed(3210)
+train.index <- createDataPartition(df.model.tree$isReadmit, p=0.7, list = FALSE)
+train.df.tree <- df.model.tree[train.index,]
+test.df.tree <- df.model.tree[-train.index,]
+```
+  All iterations of the decision tree will include all predictor variables. But what differs across the iterations is the maximum depth. I will compare the test model accuracies for the varying maximum depths.
+  
+  It should also be noted that cp (complexity parameter) tells the model: if the next best split in a decision tree does not reduce the tree's complexity by the given amount, then the split should not be pursued. I set this parameter to 0.001. I also set the minsplit parameter to 10, which means that there must be a minimum of 20 observations in a node for a split to be attempted. I let xval = 5, which means I would like for there to be a 5-fold cross-validation in the data set. Lastly, I set maxdepth to 4, which means that a node can only have a maximum depth of 5 splits (since the root node is counted as depth 0).
+
+```{r Decision Tree - 1st iteration}
+train.ct1 <- rpart(isReadmit ~ ., data = train.df.tree, method = "class", 
+                   minsplit = 10, cp = 0.001, maxdepth = 4, xval = 5)
+test.ct.pred1 <- predict(train.ct1, test.df.tree, type = "class")
+confusionMatrix(test.ct.pred1, as.factor(test.df.tree$isReadmit), positive = "1")
+
+printcp(train.ct1)
+```
+  
+  In this model, the accuracy is 62.72%, and the sensitivity is 71.31%. This is not too much better than the previous models. In addition, if we look at the output of cross-validation errors, we see that the 'xerror' is fairly high even at nsplit = 7. When we multiply the 'xerror' value of 0.86295 by the root node error of 0.44421, we obtain (1 - accuracy rate), which is the misclassification rate. So, the lower 'xerror' is the better. Let's run another iteration of this model, this time with a much greater maxdepth of 20.
+
+```{r Tree Model 2}
+train.ct2 <- rpart(isReadmit ~ ., data = train.df.tree, method = "class", 
+                   minsplit = 50, cp = 0.001, maxdepth = 20, xval = 5)
+test.ct.pred2 <- predict(train.ct2, test.df.tree, type = "class")
+confusionMatrix(test.ct.pred2, as.factor(test.df.tree$isReadmit), positive = "1")
+printcp(train.ct2)
+```
+
+  Although the accuracy rate decreased slightly to 62.61%, it was more than made up for by the fact that the sensitivity rate increased to a healthy 75.29%. Since for this purpose, I am most interested in predicting which patients are most likely to be readmitted rather than the other way around, I am ok with a lower-than-average specificity, which for this model was 46.9%.
+  
+**Part F: Conclusion**
+
+***Please see supplement for summary of all models, their accuracies, sensitivities and specificities.***
+
+In sum, I used five different algorithms to see which model would produce the best accuracy and sensitivity in terms of identifying patients who ended up being readmitted to the hospital in less than 30 days. I found that the second iteration of the decision tree, with a maxdepth of 20, gives the best sensitivity. Since for this purpose, I am most interested in predicting which patients are most likely to be readmitted, I pick the model with the highest sensitivity. Hospital administrators can use decision tree algorithms to help them see which patient characteristics are likely to put a patient in the 'readmit' category. The hospital can then implement policies and procedures to minimize the proportion of readmitted patients.
+
+
+**Sources**
+
+Beata Strack, Jonathan P. DeShazo, Chris Gennings, Juan L. Olmo, Sebastian Ventura, Krzysztof J. Cios, and John N. Clore, “Impact of HbA1c Measurement on Hospital Readmission Rates: Analysis of 70,000 Clinical Database Patient Records,” BioMed Research International, vol. 2014, Article ID 781670, 11 pages, 2014.
+
+Cms.gov. (2019). Guide to Reducing Disparities in Readmissions. [online] Available at: https://www.cms.gov/About-CMS/Agency-Information/OMH/Downloads/OMH_Readmissions_Guide.pdf.  
+
+Rubin, D. J. (2015). Hospital Readmission of Patients with Diabetes. Current Diabetes Reports, 15(4). doi: 10.1007/s11892-015-0584-7  
+
+Shmueli, G., Bruce, P. C., Yahav, I., Patel, N. R., & Lichtendahl, K. C. (2018). Data Mining for Business Analytics: Concepts, Techniques, and Applications in R. Hoboken, NJ: John Wiley & Sons, Inc.  
+
+Sinha-Gregory, N., Seley, J., Kochhar, S., DeJesus, J., Lubanksy, S., Nikolova, M., Wei, E., Gerber, L., Mauer, E., Hastu, R., Galla, N. and Greene, R. (2015). Decreasing 30-day Readmission Rates in High-Risk Diabetes Patients Using a Transitional Care Program from Inpatient to Outpatient. [online] Nyspfp.org. Available at: https://www.nyspfp.org/Materials/2017_05_Prev_DM_Readm.pdf. 
